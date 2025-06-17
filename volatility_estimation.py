@@ -1,6 +1,6 @@
 from sklearn.metrics import auc, accuracy_score, confusion_matrix, mean_squared_error, mean_absolute_percentage_error, mean_absolute_error
 from sklearn.model_selection import cross_val_score, GridSearchCV, KFold, RandomizedSearchCV, train_test_split
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, BaggingRegressor
 import pandas as pd
 import xgboost as xgb
 import numpy as np
@@ -12,6 +12,8 @@ import seaborn as sns
 from sklearn.svm import SVR
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.pipeline import make_pipeline
+from sklearn.linear_model import Ridge
+
 
 
 def main():
@@ -35,6 +37,8 @@ def main():
     df['VolMomentum'] = df['Hourly Volatility 168H'].rolling(24).mean() - df['Hourly Volatility 168H'].rolling(
         168).mean()
 
+    df['Price-Volume Correlation'] = df['close'].rolling(168).corr(df['volume'])
+
     df['Future Change Realized Volatility 168H'] = df['Hourly Return'].shift(-167).rolling(window=168).std() * 100 - df[
         'Hourly Volatility 168H']
     df.dropna(inplace=True)
@@ -46,8 +50,8 @@ def main():
     X_validation, X_test, y_validation, y_test = train_test_split(X_validation_test, y_validation_test, test_size=0.35,
                                                                   shuffle=False)
 
-    # sns.heatmap(df[X_train.columns].corr(), annot=True, fmt=".2f", cmap="coolwarm", square=True, linewidths=0.5)
-    # plt.show()
+    #sns.heatmap(df[X_train.columns].corr(), annot=True, fmt=".2f", cmap="coolwarm", square=True, linewidths=0.5)
+    #plt.show()
 
     # Insure that there is no leakage
     X_validation = X_validation[200:]
@@ -56,6 +60,9 @@ def main():
     # Insure that there is no leakage
     X_test = X_test[200:]
     y_test = y_test[200:]
+
+    fit_ltsm_neuralnet(X_train, y_train, X_validation, y_validation)
+
 
     # model = grid_search_validation(X_train, X_validation, y_train, y_validation)
     # model = grid_search(X_train, X_validation, y_train, y_validation)
@@ -70,6 +77,7 @@ def main():
                          subsample=0.75,
                          colsample_bytree=0.75)
 
+
     # Try to fit a second model Random Forest Regressor in an attempt to smooth out the noise
     model_2 = RandomForestRegressor(
         n_estimators=100,
@@ -80,6 +88,7 @@ def main():
         min_impurity_decrease=0
     )
 
+
     # Fit a third model - Support Vector Regressor to even more smooth the predictions
     model_3 = make_pipeline(
         RobustScaler(),
@@ -87,6 +96,8 @@ def main():
             C=0.5,
             epsilon=0.02,
             gamma = 0.1))
+
+    models = [model, model_2, model_3] # Save the definition of the tree models, might come in handy when we need to fit models for something like aggregated predictions
 
     model.fit(X_train, y_train.values.ravel())  # Fit the model0
     #get_xboost_feature_importance(model, X_train)
@@ -101,6 +112,7 @@ def main():
     predictions_2 = model_2.predict(X_validation)
     predictions_3 = model_3.predict(X_validation)
 
+    #aggregation_model = fit_ridge_aggregation(models, X_train, y_train)
 
     plt.plot(y_train[0:1000].reset_index(drop=True), label='Realized Change Volatility next 7 days',
              color='blue')  # Plot the realized Future 7 Day Volatility
@@ -125,9 +137,9 @@ def main():
     #plt.plot(pd.Series(predictions[0:1000]).rolling(6).mean(),
     #         label='XBoost Predicted Volatility Change next 7 days MA(6)',
     #         color='red')  # Plot the predicted future 7 day volatility
-    #plt.plot(pd.Series(predictions_2[0:1000]).rolling(6).mean(),
-    #         label='RF Predicted Volatility Change next 7 days MA(6)',
-    #         color='orange')  # RF Plot the predicted future 7 day volatility
+    plt.plot(pd.Series(predictions_2[0:1000]).rolling(6).mean(),
+             label='RF Predicted Volatility Change next 7 days MA(6)',
+             color='orange')  # RF Plot the predicted future 7 day volatility
     plt.plot(pd.Series(predictions_3[0:1000]).rolling(6).mean(),
              label='SVR Predicted Volatility Change next 7 days MA(6)',
              color='black')  # SVR Plot the predicted future 7 day volatility
@@ -135,6 +147,9 @@ def main():
              label='Aggregated Prediction', color='purple')
     plt.plot(X_validation['Hourly Volatility 168H'][0:1000].reset_index(drop=True),
              label='7 Day Volatility at prediction time', color='green')
+
+
+
     plt.ylabel('Volatility')
     plt.legend()
     plt.title('First 3 Week Vallidation')
@@ -149,7 +164,6 @@ def main():
     print(
         f"Correlation between the Aggregated prediction and realized volatility is {round( y_validation.iloc[:, 0].corr(pd.Series((predictions + predictions_2 + predictions_3)/ 3, index=y_validation.index)), 3)}, Root MSE is {round(math.sqrt(mean_squared_error(y_validation, (predictions + predictions_2 + predictions_3)/3)),3)}, MAE is {round(mean_absolute_error(y_validation, (predictions + predictions_2 + predictions_3)/3),3)}")
     
-
 
 def grid_search(X_train, X_validation, y_train, y_validation, param_grid=None):
     from sklearn.model_selection import GridSearchCV
@@ -348,8 +362,80 @@ def get_randomforest_feature_importance(model, X_train):
     plt.tight_layout()
     plt.show()
 
+# Fit an aggregation of the model predictions based on a Ridge Regression where the training is done using K-fold splitting i.e. train on all folds and predict the current fold
+def fit_ridge_aggregation(models, X_train, y_train):
+    kf = KFold(n_splits=5, shuffle= False)
+    predictions = np.zeros((X_train.shape[0], 3))
+
+    for train_idx, val_idx in kf.split(X_train):
+        X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+        y_tr = y_train.iloc[train_idx]
+
+        models[0].fit(X_tr, y_tr.values.ravel())
+        models[1].fit(X_tr, y_tr.values.ravel())
+        models[2].fit(X_tr, y_tr.values.ravel())
+
+        predictions[val_idx, 0] = models[0].predict(X_val)
+        predictions[val_idx, 1] = models[1].predict(X_val)
+        predictions[val_idx, 2] = models[2].predict(X_val)
+
+    aggregation_model = Ridge()
+    aggregation_model.fit(predictions, y_train)
+    return aggregation_model
+
+def fit_ltsm_neuralnet(X_train, y_train, X_validation, y_validation):
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.callbacks import EarlyStopping
 
 
 
-if __name__ == '__main__':
+    def create_sequences(X, y, window_size):
+        Xs, ys = [], []
+
+        for i in range(len(X) - window_size):
+            Xs.append(X[i:i + window_size])
+            ys.append(y.iloc[i + window_size])
+        return np.array(Xs), np.array(ys)
+
+    # Flatten for scaling
+    n_samples, n_features = X_train.shape
+    X_train = X_train.to_numpy().reshape(-1, n_features)
+    X_validation = X_validation.to_numpy().reshape(-1, n_features)
+
+    # Scale
+    scaler = RobustScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_validation = scaler.transform(X_validation)
+
+    window_size = 24
+    X_seq_train, y_seq_train = create_sequences(X_train, y_train, window_size)
+    X_seq_val, y_seq_val = create_sequences(X_validation, y_validation, window_size)
+
+    # Now get shape
+    n_timesteps, n_features = X_seq_train.shape[1], X_seq_train.shape[2]
+
+    model = Sequential([
+        LSTM(64, input_shape=(n_timesteps, n_features),
+                return_sequences=False),
+                Dropout(0.2), Dense(1)
+    ])
+
+    model.compile(optimizer='adam', loss='huber')
+    early_stop = EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True)
+
+    model.fit(X_seq_train, y_seq_train, validation_split=0.2, epochs=100, batch_size=32, callbacks=[early_stop])
+    loss = model.evaluate(X_seq_val, y_seq_val)
+    print(f'LSTM Loss Function i.e. Huber Loss is {loss}')
+
+    predictions = model.predict(X_seq_val)
+
+    plt.plot(y_validation[window_size:1000 + window_size].reset_index(drop=True), label='Realized Change Volatility next 7 days', color='blue')  # Plot the realized Future 7 Day Volatility
+    plt.plot(pd.Series(predictions.reshape(-1)[0:1000]).rolling(6).mean(), label='RF Predicted Volatility Change next 7 days MA(6)', color='orange')  # RF Plot the predicted future 7 day volatility
+    plt.show()
+    print(
+        f"Correlation between the Xboost predicted and realized volatility is {round(y_validation.iloc[24:, 0].corr(pd.Series(predictions.ravel(), index = y_validation.index[24:])),3 )}, Root MSE is {round(math.sqrt(mean_squared_error(y_validation[24:], predictions.ravel())),3)}, MAE is {round(mean_absolute_error(y_validation[24:], predictions.ravel()),3)}")
+
+
+if (__name__ == '__main__'):
     main()
