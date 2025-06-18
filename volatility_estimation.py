@@ -13,7 +13,7 @@ from sklearn.svm import SVR
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.linear_model import Ridge
-
+from tensorflow.python.keras.saving.saved_model.serialized_attributes import recurrent
 
 
 def main():
@@ -34,10 +34,19 @@ def main():
     df['DayOfWeek'] = df['date'].dt.dayofweek
     df['Hour'] = np.sin(2 * np.pi * df['date'].dt.hour / 24)
 
-    df['VolMomentum'] = df['Hourly Volatility 168H'].rolling(24).mean() - df['Hourly Volatility 168H'].rolling(
-        168).mean()
+    #df['Normalized Volume'] = np.log(df['volume'] / df['volume'].rolling(168).median())
+    df['VSA'] = calculate_vsa(df)
 
-    df['Price-Volume Correlation'] = df['close'].rolling(168).corr(df['volume'])
+    """
+    df.groupby(df['date'].dt.hour)['Normalized Volume'].mean().plot(kind = 'line', color = 'skyblue')
+    plt.title('Average Normalized Volume by Hour')
+    plt.xlabel('Hour of Day')
+    plt.ylabel('Average Volume')
+    plt.show()
+    """
+
+
+    df['VolMomentum'] = df['Hourly Volatility 168H'].rolling(24).mean() - df['Hourly Volatility 168H'].rolling(168).mean()
 
     df['Future Change Realized Volatility 168H'] = df['Hourly Return'].shift(-167).rolling(window=168).std() * 100 - df[
         'Hourly Volatility 168H']
@@ -45,7 +54,7 @@ def main():
 
     # Split into training, validation and testing
     X_train, X_validation_test, y_train, y_validation_test = train_test_split(
-        df[['Hourly Volatility 168H', "Hawkes 168H", 'Reversability 72H', 'DayOfWeek', "Hour", "VolMomentum"]],
+        df[['Hourly Volatility 168H', "Hawkes 168H", 'Reversability 72H', 'DayOfWeek', "Hour", 'VSA', 'VolMomentum']],
         df[['Future Change Realized Volatility 168H']], test_size=0.3, shuffle=False)
     X_validation, X_test, y_validation, y_test = train_test_split(X_validation_test, y_validation_test, test_size=0.35,
                                                                   shuffle=False)
@@ -383,12 +392,40 @@ def fit_ridge_aggregation(models, X_train, y_train):
     aggregation_model.fit(predictions, y_train)
     return aggregation_model
 
+def calculate_vsa(df, lookback = 168):
+    import scipy.stats as stats
+    import pandas_ta as ta
+    atr = ta.atr(df['high'], df['low'], df['close'], lookback)
+    vol_median = df['volume'].rolling(lookback).median()
+
+    df['norm_range'] = (df['high'] - df['low']) / atr
+    df['norm_volume'] = df['volume'] / vol_median
+
+    norm_vol = df['norm_volume'].to_numpy()
+    norm_range = df['norm_range'].to_numpy()
+
+    range_dev = np.zeros(len(df))
+    range_dev[:] = np.nan
+
+    for i in range(lookback * 2, len(df)):
+        window = df.iloc[i - lookback + 1 : i + 1]
+        slope, intercept, r_val, _, _ = stats.linregress(window['norm_volume'], window['norm_range'])
+
+        if slope <= 0.0 or r_val < 0.2:
+            range_dev[i] = 0
+            continue
+
+        pred_range = intercept + slope * norm_vol[i]
+        range_dev[i] = norm_range[i] - pred_range
+
+    return pd.Series(range_dev, index = df.index)
+
 def fit_ltsm_neuralnet(X_train, y_train, X_validation, y_validation):
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.callbacks import EarlyStopping
-
-
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.regularizers import l1, l2
 
     def create_sequences(X, y, window_size):
         Xs, ys = [], []
@@ -416,13 +453,16 @@ def fit_ltsm_neuralnet(X_train, y_train, X_validation, y_validation):
     n_timesteps, n_features = X_seq_train.shape[1], X_seq_train.shape[2]
 
     model = Sequential([
-        LSTM(64, input_shape=(n_timesteps, n_features),
-                return_sequences=False),
-                Dropout(0.2), Dense(1)
+        LSTM(24, input_shape=(n_timesteps, n_features),
+                activation = 'tanh',
+                return_sequences=False,
+                kernel_regularizer = l2(0.0001),
+                recurrent_dropout = 0.3),
+        Dropout(0.3), Dense(1, kernel_regularizer = l2(0.0001))
     ])
 
-    model.compile(optimizer='adam', loss='huber')
-    early_stop = EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True)
+    model.compile(optimizer= Adam(learning_rate = 0.0001), loss='huber')
+    early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
     model.fit(X_seq_train, y_seq_train, validation_split=0.2, epochs=100, batch_size=32, callbacks=[early_stop])
     loss = model.evaluate(X_seq_val, y_seq_val)
@@ -434,7 +474,7 @@ def fit_ltsm_neuralnet(X_train, y_train, X_validation, y_validation):
     plt.plot(pd.Series(predictions.reshape(-1)[0:1000]).rolling(6).mean(), label='RF Predicted Volatility Change next 7 days MA(6)', color='orange')  # RF Plot the predicted future 7 day volatility
     plt.show()
     print(
-        f"Correlation between the Xboost predicted and realized volatility is {round(y_validation.iloc[24:, 0].corr(pd.Series(predictions.ravel(), index = y_validation.index[24:])),3 )}, Root MSE is {round(math.sqrt(mean_squared_error(y_validation[24:], predictions.ravel())),3)}, MAE is {round(mean_absolute_error(y_validation[24:], predictions.ravel()),3)}")
+        f"Correlation between the Neural Network predicted and realized volatility is {round(y_validation.iloc[window_size:, 0].corr(pd.Series(predictions.ravel(), index = y_validation.index[window_size:])),3 )}, Root MSE is {round(math.sqrt(mean_squared_error(y_validation[window_size:], predictions.ravel())),3)}, MAE is {round(mean_absolute_error(y_validation[window_size:], predictions.ravel()),3)}")
 
 
 if (__name__ == '__main__'):
